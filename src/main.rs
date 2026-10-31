@@ -1,10 +1,15 @@
 // extcheck: detecta si la extension de un archivo coincide con su contenido real (magic bytes).
 // Uso: extcheck <archivo|carpeta> [mas rutas...]
 // Sin dependencias externas, solo std.
+//
+// Ademas de la firma, refina el diagnostico:
+//   - ZIP: mira los nombres internos (word/ => docx, xl/ => xlsx, ppt/ => pptx, ...)
+//   - PE: distingue exe / dll / sys leyendo el encabezado
+//   - Sin firma: adivina si es texto (HTML, XML, JSON, script, Markdown...) o binario
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -114,16 +119,229 @@ fn expected(ext: &str) -> Option<&'static [Kind]> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Utilidades de lectura
+// ---------------------------------------------------------------------------
+
+fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
+    f.seek(SeekFrom::Start(off)).ok()?;
+    let mut v = vec![0u8; len];
+    f.read_exact(&mut v).ok()?;
+    Some(v)
+}
+
+fn u16le(b: &[u8], o: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(o..o + 2)?.try_into().ok()?))
+}
+
+fn u32le(b: &[u8], o: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
+}
+
+// ---------------------------------------------------------------------------
+// Refinamiento: PE (exe / dll / sys)
+// ---------------------------------------------------------------------------
+
+/// Devuelve "dll", "sys" (subsistema nativo) o "exe" leyendo el encabezado PE.
+fn pe_detail(f: &mut File) -> Option<&'static str> {
+    let dos = read_at(f, 0, 0x40)?;
+    let lfanew = u32le(&dos, 0x3C)? as u64;
+    // firma (4) + COFF (20) + optional header hasta el campo Subsystem (offset 68 + 2)
+    let h = read_at(f, lfanew, 24 + 70)?;
+    if &h[0..4] != b"PE\0\0" {
+        return None;
+    }
+    let characteristics = u16le(&h, 4 + 18)?;
+    let subsystem = u16le(&h, 24 + 68)?;
+    if characteristics & 0x2000 != 0 {
+        Some("dll")
+    } else if subsystem == 1 {
+        Some("sys")
+    } else {
+        Some("exe")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Refinamiento: ZIP (mira los nombres del directorio central)
+// ---------------------------------------------------------------------------
+
+fn zip_names(f: &mut File) -> Option<Vec<String>> {
+    let len = f.metadata().ok()?.len();
+    let tail_len = len.min(65_557);
+    let tail = read_at(f, len - tail_len, tail_len as usize)?;
+    if tail.len() < 22 {
+        return None;
+    }
+
+    // buscar el End Of Central Directory (PK\x05\x06) desde el final
+    let eocd_pos = (0..=tail.len() - 22)
+        .rev()
+        .find(|&i| &tail[i..i + 4] == b"PK\x05\x06")?;
+    let eocd = &tail[eocd_pos..];
+    let cd_size = u32le(eocd, 12)? as usize;
+    let cd_off = u32le(eocd, 16)? as u64;
+    if cd_size == 0 || cd_size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let cd = read_at(f, cd_off, cd_size)?;
+
+    let mut names = Vec::new();
+    let mut pos = 0usize;
+    while pos + 46 <= cd.len() && &cd[pos..pos + 4] == b"PK\x01\x02" && names.len() < 100_000 {
+        let n = u16le(&cd, pos + 28)? as usize;
+        let e = u16le(&cd, pos + 30)? as usize;
+        let c = u16le(&cd, pos + 32)? as usize;
+        let name = cd.get(pos + 46..pos + 46 + n)?;
+        names.push(String::from_utf8_lossy(name).into_owned());
+        pos += 46 + n + e + c;
+    }
+    Some(names)
+}
+
+/// Segun la estructura interna, que extensiones tienen sentido. None = zip generico.
+fn zip_guess(names: &[String]) -> Option<&'static [&'static str]> {
+    let starts = |p: &str| names.iter().any(|n| n.starts_with(p));
+    let exact = |p: &str| names.iter().any(|n| n == p);
+
+    if starts("word/") && exact("[Content_Types].xml") {
+        Some(&["docx", "docm", "dotx", "dotm"])
+    } else if starts("xl/") && exact("[Content_Types].xml") {
+        Some(&["xlsx", "xlsm", "xltx", "xlsb"])
+    } else if starts("ppt/") && exact("[Content_Types].xml") {
+        Some(&["pptx", "pptm", "potx", "ppsx"])
+    } else if exact("AndroidManifest.xml") {
+        Some(&["apk", "xapk"])
+    } else if exact("META-INF/container.xml") {
+        Some(&["epub"])
+    } else if exact("mimetype") && exact("content.xml") {
+        Some(&["odt", "ods", "odp", "odg"])
+    } else if exact("META-INF/MANIFEST.MF") {
+        Some(&["jar", "war", "ear", "xpi", "zip"])
+    } else {
+        None
+    }
+}
+
+const ZIP_FAMILY: &[&str] = &[
+    "zip", "docx", "xlsx", "pptx", "odt", "ods", "jar", "apk", "epub", "xpi",
+];
+
+// ---------------------------------------------------------------------------
+// Refinamiento: archivos sin firma (texto o binario desconocido)
+// ---------------------------------------------------------------------------
+
+/// Devuelve (descripcion, extension sugerida). La sugerencia solo aparece cuando hay
+/// senales suficientes; en texto siempre es una estimacion, nunca una certeza.
+fn text_guess(b: &[u8]) -> (&'static str, Option<&'static str>) {
+    if b.is_empty() {
+        return ("archivo vacio", None);
+    }
+    if b.contains(&0) {
+        return ("binario sin firma conocida", None);
+    }
+    let b = if b.starts_with(&[0xEF, 0xBB, 0xBF]) { &b[3..] } else { b };
+    let text = String::from_utf8_lossy(b).into_owned();
+    let low = text.trim_start().to_lowercase();
+    let first = low.lines().next().unwrap_or("");
+
+    if low.starts_with("#!") {
+        let ext = if first.contains("python") {
+            "py"
+        } else if first.contains("node") {
+            "js"
+        } else {
+            "sh"
+        };
+        return ("script (shebang)", Some(ext));
+    }
+    if low.starts_with("<!doctype html") || low.starts_with("<html") {
+        return ("HTML", Some("html"));
+    }
+    if low.starts_with("<?xml") {
+        return ("XML", Some("xml"));
+    }
+    let json_like = low.starts_with('{')
+        || (low.starts_with('[')
+            && low[1..]
+                .trim_start()
+                .chars()
+                .next()
+                .map_or(false, |c| matches!(c, '{' | '"' | '[' | '0'..='9' | '-')));
+    if json_like && low.contains('"') {
+        return ("posible JSON", Some("json"));
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let has = |p: &str| lines.iter().any(|l| l.trim_start().starts_with(p));
+
+    // codigo fuente (senales fuertes)
+    if has("#include") {
+        return ("codigo C/C++", Some("c"));
+    }
+    if has("fn main") || has("use std::") || has("pub fn ") {
+        return ("codigo Rust", Some("rs"));
+    }
+    if has("def ") || (has("import ") && !text.contains(';')) {
+        return ("codigo Python", Some("py"));
+    }
+
+    // Markdown: cuantas familias de marcas distintas aparecen
+    let heading = has("# ") || has("## ") || has("### ");
+    let bullet = has("- ") || has("* ");
+    let fence = has("```");
+    let link = text.contains("](");
+    let bold = text.contains("**");
+    let score = [heading, bullet, fence, link, bold].iter().filter(|x| **x).count();
+    if score >= 2 {
+        ("texto con formato Markdown", Some("md"))
+    } else if heading {
+        ("texto (posible Markdown)", None)
+    } else {
+        ("texto plano", Some("txt"))
+    }
+}
+
+fn kind_ext(k: Kind) -> Option<&'static str> {
+    Some(match k {
+        Kind::JavaClass => "class",
+        Kind::Png => "png",
+        Kind::Jpeg => "jpg",
+        Kind::Gif => "gif",
+        Kind::Pdf => "pdf",
+        Kind::Rar => "rar",
+        Kind::SevenZ => "7z",
+        Kind::Gzip => "gz",
+        Kind::Mp3 => "mp3",
+        Kind::Mp4 => "mp4",
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Verificacion
+// ---------------------------------------------------------------------------
+
 enum Verdict {
     Ok,
     Mismatch { high: bool },
+    Warn, // la firma cuadra, pero el contenido interno sugiere otra extension
     UnknownExt,
 }
 
-fn check(path: &Path) -> std::io::Result<(Kind, Verdict)> {
-    let mut buf = [0u8; 16];
-    let n = File::open(path)?.read(&mut buf)?;
-    let kind = detect(&buf[..n]);
+struct Report {
+    kind: Kind,
+    verdict: Verdict,
+    note: String,
+    expected: String,
+    suggest: Option<String>,
+}
+
+fn check(path: &Path) -> io::Result<Report> {
+    let mut f = File::open(path)?;
+    let mut head = Vec::new();
+    (&mut f).take(4096).read_to_end(&mut head)?;
+    let kind = detect(&head);
 
     let ext = path
         .extension()
@@ -131,7 +349,49 @@ fn check(path: &Path) -> std::io::Result<(Kind, Verdict)> {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
 
-    let verdict = match expected(&ext) {
+    let exp = expected(&ext);
+    let expected_desc = match exp {
+        Some(k) => k.iter().map(|x| format!("{:?}", x)).collect::<Vec<_>>().join(" o "),
+        None => "?".to_string(),
+    };
+
+    // refinamiento segun el tipo detectado
+    let mut note = String::new();
+    let mut warn = false;
+    let suggest: Option<String>;
+    match kind {
+        Kind::Pe => {
+            let g = pe_detail(&mut f);
+            if let Some(g) = g {
+                note = format!("PE tipo {g}");
+                warn = match ext.as_str() {
+                    "exe" | "scr" => g == "dll",
+                    "dll" | "ocx" => g != "dll",
+                    _ => false,
+                };
+            }
+            suggest = Some(g.unwrap_or("exe").to_string());
+        }
+        Kind::Zip => {
+            let mut s = "zip";
+            if let Some(names) = zip_names(&mut f) {
+                if let Some(g) = zip_guess(&names) {
+                    note = format!("zip con estructura de {}", g[0]);
+                    warn = ZIP_FAMILY.contains(&ext.as_str()) && !g.contains(&ext.as_str());
+                    s = g[0];
+                }
+            }
+            suggest = Some(s.to_string());
+        }
+        Kind::Unknown => {
+            let (d, s) = text_guess(&head);
+            note = d.to_string();
+            suggest = s.map(String::from);
+        }
+        other => suggest = kind_ext(other).map(String::from),
+    }
+
+    let verdict = match exp {
         None => {
             // extension rara: lo unico grave es que sea un ejecutable disfrazado
             if kind.is_executable() {
@@ -140,10 +400,17 @@ fn check(path: &Path) -> std::io::Result<(Kind, Verdict)> {
                 Verdict::UnknownExt
             }
         }
-        Some(ok) if ok.contains(&kind) => Verdict::Ok,
+        Some(ok) if ok.contains(&kind) => {
+            if warn {
+                Verdict::Warn
+            } else {
+                Verdict::Ok
+            }
+        }
         Some(_) => Verdict::Mismatch { high: kind.is_executable() },
     };
-    Ok((kind, verdict))
+
+    Ok(Report { kind, verdict, note, expected: expected_desc, suggest })
 }
 
 fn walk(path: &Path, out: &mut Vec<PathBuf>) {
@@ -158,17 +425,46 @@ fn walk(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Separa la linea pegada/arrastrada en rutas. Windows entrecomilla las rutas con espacios.
+fn parse_paths(line: &str) -> Vec<String> {
+    let line = line.trim();
+    if !line.contains('"') {
+        return if line.is_empty() { vec![] } else { vec![line.to_string()] };
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                if !in_quote && !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn run() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
 
+    // doble clic en el .exe: pedir la ruta en vez de cerrarse
     if args.is_empty() && launched_from_explorer() {
         println!("Arrastra aqui un archivo o carpeta y presiona Enter:");
         let mut line = String::new();
         let _ = io::stdin().read_line(&mut line);
-        let p = line.trim().trim_matches('"').to_string();
-        if !p.is_empty() {
-            args.push(p);
-        }
+        args = parse_paths(&line);
     }
 
     if args.is_empty() {
@@ -181,22 +477,45 @@ fn run() -> ExitCode {
         walk(Path::new(a), &mut files);
     }
 
-    let (mut total, mut bad) = (0usize, 0usize);
+    let (mut total, mut bad, mut warns) = (0usize, 0usize, 0usize);
     for f in &files {
         total += 1;
         match check(f) {
-            Ok((kind, Verdict::Mismatch { high })) => {
-                bad += 1;
-                let tag = if high { "ALERTA" } else { "MISMATCH" };
-                println!("[{tag}] {} -> contenido real: {:?}", f.display(), kind);
+            Ok(r) => {
+                let mut detail = if r.note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", r.note)
+                };
+                if let Some(s) = &r.suggest {
+                    detail.push_str(&format!(" -> extension probable: .{s}"));
+                }
+                match r.verdict {
+                    Verdict::Mismatch { high } => {
+                        bad += 1;
+                        let tag = if high { "ALERTA" } else { "MISMATCH" };
+                        println!(
+                            "[{tag}] {} -> esperado: {}, real: {:?}{detail}",
+                            f.display(),
+                            r.expected,
+                            r.kind
+                        );
+                    }
+                    Verdict::Warn => {
+                        warns += 1;
+                        println!(
+                            "[AVISO] {} -> la firma cuadra, pero el contenido sugiere otra extension{detail}",
+                            f.display()
+                        );
+                    }
+                    Verdict::Ok | Verdict::UnknownExt => {}
+                }
             }
-            Ok((_, Verdict::Ok)) => {}
-            Ok((_, Verdict::UnknownExt)) => {}
             Err(e) => eprintln!("[ERR] {}: {e}", f.display()),
         }
     }
 
-    println!("\n{total} archivos revisados, {bad} sospechosos");
+    println!("\n{total} archivos revisados, {bad} sospechosos, {warns} avisos");
     if bad > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
